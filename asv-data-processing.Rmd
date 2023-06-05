@@ -1,0 +1,82 @@
+---
+title: "16S rRNA Sequence Data Processing"
+author: "Brett D. Jameson"
+date: "2023-06-05"
+output: html_document
+---
+
+## Saanich Inlet Redox (SaanDox) Experiment: Processing of ASV and taxonomy tables 
+
+This file contains code scripts for cleaning and processing of ASV and taxonomy tables output from QIIME 16S rRNA sequences analysis pipeline. These data were obtained as part of the collaborative research project entitled the Saanich Inlet Redox (SaanDox) Experiment 
+
+## Install and load required packages
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+## install packages if you dont already have them in your library
+if ("devtools" %in% rownames(installed.packages()) == 'FALSE') install.packages('devtools') 
+if ("gridExtra" %in% rownames(installed.packages()) == 'FALSE') install.packages('gridExtra') 
+if ("plyr" %in% rownames(installed.packages()) == 'FALSE') install.packages('plyr') 
+if ("dplyr" %in% rownames(installed.packages()) == 'FALSE') install.packages('dplyr') 
+if ("tidyverse" %in% rownames(installed.packages()) == 'FALSE') install.packages('tidyverse') 
+
+#Read in required libraries
+
+library("devtools")
+library("ggplot2")
+library("gridExtra")
+library('plyr')
+library('dplyr')
+library("tidyverse")
+library("phyloseq")
+```
+
+## Read Bacteria and Archaea ASV tables, taxonomies, and associated metadata
+
+```{r Read data files}
+metadata <- read.table(file="./data/saandox-seqs-metadata.txt", header = TRUE)
+metadata <- metadata %>% mutate(sample.id = gsub("-", ".", sample.id))
+
+bact.asv <- read.csv(file = "./data/saandox-bact-asv-table.csv") 
+names(bact.asv) <- gsub("X", "", names(bact.asv)) # remove X character from column names
+
+bact.tax <- read.csv(file = "./data/saandox-bact-taxonomy.csv") 
+```
+
+## Clean asv and taxonomy tables
+
+```{r Process taxonomy data, echo=FALSE, include=FALSE}
+bact.tax <- bact.tax %>% separate(Taxon,c("Domain","Phylum", "Class", "Order", "Family", "Genus"), sep=";") %>% ## This will remove species column which is not needed
+  mutate(Domain = gsub('.*__', '', Domain)) %>% mutate(Phylum = gsub('.*__', '', Phylum)) %>%
+  mutate(Class = gsub('.*__', '', Class)) %>% mutate(Order = gsub('.*__', '', Order)) %>%
+  mutate(Family = gsub('.*__', '', Family)) %>% mutate(Genus = gsub('.*__', '', Genus)) %>%
+  rename(ASV = Feature.ID)
+write_csv(bact.tax, file = "./data/saandox-bact-taxonomy-clean.csv") # Save cleaned taxonomy table
+```
+
+## Filter rare taxa using Phyloseq
+
+We will combine the ASV tables and corresponding taxonomy tables into a phyloseq object.
+
+```{r Remove rare taxa}
+rownames(bact.asv) <- as.character(unlist(bact.asv[, 1])) # Transform to data matrices with taxa as row names
+bact.asv <- as.matrix(bact.asv[, -1])
+rownames(bact.tax) <- as.character(unlist(bact.tax[, 1]))
+bact.tax <- as.matrix(bact.tax[, -1])
+
+bact.asv.table = otu_table(bact.asv, taxa_are_rows = TRUE) # Create phyloseq objects
+bact.tax.table = tax_table(bact.tax)
+bact.phyloseq <- phyloseq(bact.asv.table, bact.tax.table)
+
+## Select taxa that occur greater 10 times in at least 10% of samples
+bact.phyloseq.filter <- filter_taxa(bact.phyloseq, function(x) sum(x > 10) > (0.10*length(x)), TRUE)
+bact.phyloseq.filter
+```
+
+## Save filtered ASV tables
+
+```{r Save clean data}
+bact.asv.filter = as(otu_table(bact.phyloseq.filter), "matrix")
+bact.asv.filter <- tibble::rownames_to_column(as.data.frame(bact.asv.filter), "ASV")
+write_csv(bact.asv.filter, file = "./data/saandox-bact-asv-filter.csv")
+```
+
