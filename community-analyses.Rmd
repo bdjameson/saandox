@@ -1,0 +1,378 @@
+---
+title: "Microbial Community Analyses"
+author: "Brett D. Jameson"
+date: "2023-06-06"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+## install packages if you dont already have them in your library
+if ("devtools" %in% rownames(installed.packages()) == 'FALSE') install.packages('devtools') 
+if ("gridExtra" %in% rownames(installed.packages()) == 'FALSE') install.packages('gridExtra') 
+if ("plyr" %in% rownames(installed.packages()) == 'FALSE') install.packages('plyr') 
+if ("dplyr" %in% rownames(installed.packages()) == 'FALSE') install.packages('dplyr') 
+if ("tidyverse" %in% rownames(installed.packages()) == 'FALSE') install.packages('tidyverse') 
+if ("zCompositions" %in% rownames(installed.packages()) == 'FALSE') install.packages('zCompositions') 
+if ("compositions" %in% rownames(installed.packages()) == 'FALSE') install.packages('compositions') 
+if ("WGCNA" %in% rownames(installed.packages()) == 'FALSE') install.packages('WGCNA') 
+
+#Read in required libraries
+
+library("devtools")
+library("ggplot2")
+library("gridExtra")
+library('plyr')
+library('dplyr')
+library("tidyverse")
+library("phyloseq")
+library("zCompositions")
+library("compositions")
+library("WGCNA")
+```
+
+# Saanich Inlet Redox (SaanDox) Experiment: Microbial Community Analyses
+
+This file contains code scripts for multivariate analysis of Bacterial and Archaea community compositon inferred from 16S rRNA gene sequences. These data were obtained as part of the collaborative research project entitled the Saanich Inlet Redox (SaanDox) Experiment.
+
+## Read Bacteria and Archaea ASV tables, taxonomies, and associated metadata
+
+```{r Read data}
+metadata <- read.table(file="./data/saandox-seqs-metadata.txt", header = TRUE)
+metadata <- metadata %>% mutate(sample.id = gsub("-", ".", sample.id)) %>%
+  subset(month > 8 | month == 1 | month == 2)
+rownames(metadata) <- as.character(unlist(metadata[, 1]))
+
+bact.asv <- read.csv(file = "./data/saandox-bact-asv-filter.csv") 
+names(bact.asv) <- gsub("X", "", names(bact.asv)) # remove X character from column names
+rownames(bact.asv) <- as.character(unlist(bact.asv[, 1])) # Transform to data matrices with taxa as row names
+bact.asv <- as.data.frame(bact.asv[, -1])
+#bact.asv <- as.matrix(bact.asv[colnames(bact.asv)[colnames(bact.asv) %in% rownames(metadata)]]) # select columns that match metadata
+
+bact.tax <- read.csv(file = "./data/saandox-bact-taxonomy-filter.csv") 
+```
+
+## Compositional data transformations
+
+First we need to convert the ASV tables to numerical data matrices to perform compositional data transformations. Zero counts are replaced first using the cmultrep function and then ASV counts are centre-log ratio transformed prior to downstream analyses.
+
+```{r CoDa transformations}
+bact.asv.zeroRepl <- cmultRepl(bact.asv, label = 0, method = "GBM", output = "p-counts")
+bact.asv.clrTrans <- apply(bact.asv.zeroRepl, 2, function(x) {
+  log(x) - mean(log(x))
+})
+```
+
+# Weighted gene correlational network analysis (WGCNA)
+
+## Sample clustering
+
+First we are going to create some cluster dendrograms to detect and remove outlier samples
+
+```{r Sample clustering}
+# Take a quick look at what is in the data set:
+data = t(bact.asv.clrTrans)
+dim(data);
+names(data);
+
+# Assign data to new working variable to streamline code
+datExpr0 = as.data.frame(data);
+
+# Check for genes and samples with too many missing values:
+gsg = goodSamplesGenes(datExpr0, verbose = 3);
+gsg$allOK
+# If the last statement returns TRUE, all genes have passed the cuts. 
+# If not, we remove the offending genes and samples from the data:
+if (!gsg$allOK)
+{
+  # Optionally, print the gene and sample names that were removed:
+  if (sum(!gsg$goodGenes) > 0)
+    printFlush(paste("Removing genes:", 
+                     paste(names(datExpr0)[!gsg$goodGenes], collapse = ", ")));
+  if (sum(!gsg$goodSamples) > 0)
+    printFlush(paste("Removing samples:", 
+                     paste(rownames(datExpr0)[!gsg$goodSamples], collapse = ", ")));
+  # Remove the offending genes and samples from the data:
+  datExpr0 = datExpr0[gsg$goodSamples, gsg$goodGenes]
+}
+# Cluster samples to check for obvious outliers.
+sampleTree = hclust(dist(datExpr0), method = "average");
+# Plot the sample tree: Open a graphic output window of size 12 by 9 inches
+sizeGrWindow(12,9)
+#pdf(file = "Plots/sampleClustering.pdf", width = 12, height = 9);
+par(cex = 0.6);
+par(mar = c(0,4,2,0))
+plot(sampleTree, main = "Sample clustering to detect outliers", sub = "", 
+     xlab = "", cex.lab = 1.5, cex.axis = 1.5, cex.main = 2)
+
+datExpr <- datExpr0[-7,] # Reomve outlier at 200m on Oct 04
+```
+## Metadata import and scaling
+
+Next we import the metadata file to match with the ASV tables. This will allow us to explore relationships between entire samples, clustered community subnetworks, and environmental variables. First we need to scale the environmental variables for the WGCNA analysis.
+
+```{r Import metadata}
+datExpr = datExpr0
+# Assign trimmed metadata to sample traits dataframe
+datTraits = metadata %>% dplyr::select(depth.m, temp, salinity, oxygen.umol.kg, sigma.theta)
+datTraits <- datTraits[-7,] # Reomve outlier at 200m on Oct 04
+datTraits.scale <- as.data.frame(scale(datTraits, center = TRUE, scale = TRUE))
+
+dim(datTraits.scale)
+names(datTraits.scale)
+```
+
+## Exploring relationships between environmental variables and sample communities
+
+We now have the expression data in the variable datExpr, and the scaled environmental traits in the variable datTraits. Before we continue with network construction and module detection, we visualize how the sample traits relate to the sample dendrogram.
+
+```{r Sample traits dendrogram}
+# Re-cluster samples
+sampleTree2 = hclust(dist(datExpr), method = "average")
+# Convert traits to a color representation: white means low, red means high, 
+# grey means missing entry
+traitColors = numbers2colors(datTraits.scale, signed = TRUE);
+# Plot the sample dendrogram and the colors underneath.
+plotDendroAndColors(sampleTree2, traitColors,
+                    groupLabels = names(datTraits.scale),
+                    main = "Sample dendrogram and trait heatmap")  
+# In the plot, white means a low value, red a high value, and 
+# grey a missing entry.The last step is to save the relevant expression and 
+# trait data for use in the next steps of the tutorial.
+save(datExpr, datTraits.scale, file = "./output/WGCNA_dataInput.RData")
+```
+## Soft thresholding 
+
+Now we need to establish the soft thresholding power. Each clr-transformed ASV count will be raised to this power to establish a scale-free topology. We are looking for an intermediate threshold power (<16) that maximizes the R2 and minimizes the overall network connectivity. R2 values above 0.8 are necessary, above 0.9 is ideal.
+
+```{r Soft thresholding}
+# Load the data saved in the first part
+lnames = load(file = "./output/WGCNA_dataInput.RData");
+# The variable lnames contains the names of loaded variables.
+
+# Choose a set of soft-thresholding powers
+powers = c(c(1:10), seq(from = 12, to=20, by=2))
+# Call the network topology analysis function
+sft = pickSoftThreshold(datExpr, powerVector = powers, verbose = 5)
+# Plot the results:
+sizeGrWindow(9, 5)
+par(mfrow = c(1,2));
+cex1 = 0.9;
+# Scale-free topology fit index as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     xlab="Soft Threshold (power)",ylab="Scale Free Topology Model Fit,signed R^2",type="n",
+     main = paste("Scale independence"));
+text(sft$fitIndices[,1], -sign(sft$fitIndices[,3])*sft$fitIndices[,2],
+     labels=powers,cex=cex1,col="red");
+# this line corresponds to using an R^2 cut-off of h
+abline(h=0.80,col="red")
+abline(h=0.90,col="red")
+# Mean connectivity as a function of the soft-thresholding power
+plot(sft$fitIndices[,1], sft$fitIndices[,5],
+     xlab="Soft Threshold (power)",ylab="Mean Connectivity", type="n",
+     main = paste("Mean connectivity"))
+text(sft$fitIndices[,1], sft$fitIndices[,5], labels=powers, cex=cex1,col="red")
+```
+## Topological overlap measure (TOM)
+
+Next we calculte the topological overlap measure, which takes into account both direct pairwise correlations between features, as well as indirect correlations between features. Then we cluster the features (ASVs) based on the TOM measure
+
+```{r TOM calculation}
+# Set the soft power threshold 
+softPower = 12;
+adjacency = adjacency(datExpr, power = softPower, type = "signed");
+
+# Turn adjacency into topological overlap 
+TOM = TOMsimilarity(adjacency, TOMType = "signed");
+dissTOM = 1-TOM
+
+# Call the hierarchical clustering function
+geneTree = hclust(as.dist(dissTOM), method = "average");
+# Plot the resulting clustering tree (dendrogram)
+sizeGrWindow(12,9)
+plot(geneTree, xlab="", sub="", main = "Gene clustering on TOM-based dissimilarity",
+     labels = FALSE, hang = 0.04);
+```
+## Clustering features into modules (subnetworks)
+
+Next we use clustering thresholds to cluster features into subnetworks based on the TOM. First we need to tell the model what our minimum module size is. This is somewhat arbitrary, but we like relatively large modules.
+
+```{r TOM clustering}
+#  Set the minimum module size relatively high: 20 taxa
+minModuleSize = 25;
+# Module identification using dynamic tree cut:
+dynamicMods = cutreeDynamic(dendro = geneTree, distM = dissTOM,
+                            deepSplit = 2, pamRespectsDendro = FALSE,
+                            minClusterSize = minModuleSize);
+table(dynamicMods)
+
+# Convert numeric lables into colors
+dynamicColors = labels2colors(dynamicMods)
+table(dynamicColors)
+# Plot the dendrogram and colors underneath
+sizeGrWindow(8,6)
+plotDendroAndColors(geneTree, dynamicColors, "Dynamic Tree Cut",
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05,
+                    main = "Gene dendrogram and module colors")
+
+```
+## Calculate module eigengenes 
+
+Combine similar modules.
+
+```{r Eigengenes}
+# Calculate eigengenes
+MEList = moduleEigengenes(datExpr, colors = dynamicColors)
+MEs = MEList$eigengenes
+# Calculate dissimilarity of module eigengenes
+MEDiss = 1-cor(MEs);
+# Cluster module eigengenes
+METree = hclust(as.dist(MEDiss), method = "average");
+# Plot the result
+sizeGrWindow(7, 6)
+plot(METree, main = "Clustering of module eigengenes",
+     xlab = "", sub = "")
+
+# Set similarity threshold for combining modules
+MEDissThres = 0.25
+# Plot the cut line into the dendrogram
+abline(h=MEDissThres, col = "red")
+# Call an automatic merging function
+merge = mergeCloseModules(datExpr, dynamicColors, cutHeight = MEDissThres, 
+                          verbose = 3)
+# The merged module colors
+mergedColors = merge$colors;
+table(mergedColors)
+# Eigengenes of the new merged modules:
+mergedMEs = merge$newMEs;
+
+# plot dendrogram before and after combining modules
+sizeGrWindow(12, 9)
+#pdf(file = "Plots/geneDendro-3.pdf", wi = 9, he = 6)
+plotDendroAndColors(geneTree, cbind(dynamicColors, mergedColors),
+                    c("Dynamic Tree Cut", "Merged dynamic"),
+                    dendroLabels = FALSE, hang = 0.03,
+                    addGuide = TRUE, guideHang = 0.05)
+
+# Rename to moduleColors
+moduleColors = mergedColors
+# Construct numerical labels corresponding to the colors
+colorOrder = c("grey", standardColors(50));
+moduleLabels = match(moduleColors, colorOrder)-1;
+MEs = mergedMEs;
+# Save module colors and labels for use in subsequent parts
+save(MEs, moduleLabels, moduleColors, geneTree, 
+     file = "./output/WGCNA-networkConstruction-auto.RData")
+```
+
+
+## Correlate modules with sample traits
+
+```{r}
+# Load network data saved in the second part.
+lnames = load(file = "WGCNA-networkConstruction-auto.RData");
+lnames
+
+# Define numbers of genes and samples
+nGenes = ncol(datExpr);
+nSamples = nrow(datExpr);
+# Recalculate MEs with color labels
+MEs0 = moduleEigengenes(datExpr, moduleColors)$eigengenes
+MEs = orderMEs(MEs0)
+moduleTraitCor = cor(MEs, datTraits, use = "p");
+moduleTraitPvalue = corPvalueStudent(moduleTraitCor, nSamples)
+
+sizeGrWindow(10,6)
+# Will display correlations and their p-values
+textMatrix = paste(signif(moduleTraitCor, 2), "\n(",
+                   signif(moduleTraitPvalue, 1), ")", sep = "");
+dim(textMatrix) = dim(moduleTraitCor)
+par(mar = c(6, 8.5, 3, 3));
+# Display the correlation values within a heatmap plot
+labeledHeatmap(Matrix = moduleTraitCor,
+               xLabels = names(datTraits),
+               yLabels = names(MEs),
+               ySymbols = names(MEs),
+               colorLabels = FALSE,
+               colors = blueWhiteRed(50),
+               textMatrix = textMatrix,
+               setStdMargins = FALSE,
+               cex.text = 0.5,
+               zlim = c(-1,1),
+               main = paste("Module-trait relationships"))
+```
+
+## Extract correlation coefficients for ASVs
+
+```{r}
+# Isolate coefficients for N2O yields
+trait.oxygen = as.data.frame(datTraits$oxygen.umol.kg);
+names(trait.oxygen) = "Trait"
+# names (colors) of the modules
+modNames = substring(names(MEs), 3)
+taxaModuleMembership = as.data.frame(cor(datExpr, MEs, use = "p"));
+MMPvalue = as.data.frame(corPvalueStudent(as.matrix(taxaModuleMembership), nSamples));
+
+names(taxaModuleMembership) = paste("MM", modNames, sep="");
+names(MMPvalue) = paste("p.MM", modNames, sep="");
+taxaTraitSignificance = as.data.frame(cor(datExpr, trait.oxygen, use = "p"));
+GSPvalue = as.data.frame(corPvalueStudent(as.matrix(taxaTraitSignificance), nSamples));
+names(taxaTraitSignificance) = paste("GS.", names(trait.oxygen), sep="");
+names(GSPvalue) = paste("p.GS.", names(trait.oxygen), sep="");
+
+module.member.traits.oxygen <- cbind(taxaModuleMembership, taxaTraitSignificance, 
+                                    GSPvalue, moduleColors)
+
+```
+
+## Extract connectivity measures and combine with corrrelation estimates
+
+```{r}
+Alldegrees1=intramodularConnectivity(adjacency, mergedColors)
+Alldegrees1 <- tibble::rownames_to_column(Alldegrees1, "ASV")
+head(Alldegrees1)
+
+connectivity <- tibble::rownames_to_column(module.member.traits.oxygen, "ASV")
+connectivity <-connectivity %>% rename(SNET = moduleColors, corr.ox = GS.Trait,
+                                       p.ox = p.GS.Trait, high.ox.membership = MMblue,
+                                       low.ox.membership = MMturquoise)
+
+connectivity <- merge(connectivity, Alldegrees1, by="ASV")
+
+connectivity.traits.tax <- merge(connectivity, bact.tax[, c("ASV", "Phylum", "Class","Order",
+                                                                  "Family")], by="ASV")
+connectivity.traits.tax <- connectivity.traits.tax %>% dplyr::select(ASV, Phylum, Class, Order, Family, SNET, kWithin,
+                                                                     high.ox.membership,low.ox.membership, corr.ox, p.ox)
+#write.csv(connectivity.traits.tax, "TaxaTraitRelationships.csv")
+```
+
+# Saandox plots
+
+```{r}
+module.metadata <- cbind(metadata[-7,], MEs)
+
+module.metadata$month = factor(module.metadata$month, levels=c('9','10','11','12', '1', '2'))
+levels(module.metadata$month) <- c("Sep-16", "Oct-16", "Nov-16", "Dec-16", "Jan-17", "Feb-17")
+module.metadata$date = factor(module.metadata$date, 
+                              levels = c("Sep-20-2016", "Oct-04-2016", "Oct-18-2016", "Nov-01-2016",
+                                         "Nov-15-2016", "Nov-29-2016", "Dec-15-2016", "Jan-04-2017",
+                                         "Jan-17-2017", "Jan-31-2017", "Feb-15-2017"))
+
+module.metadata %>% #subset(month != 2 & month != 1) %>%
+  ggplot(aes(MEblue, depth.m)) +
+  geom_point(aes(color=date)) +
+  geom_path(aes(color=date)) +
+  scale_color_discrete(name = "Sampling date") +
+  labs(y="Depth (m)", x= "High"~O[2]~"SNET (eigengene)") +
+  facet_wrap(~month) +
+  scale_y_reverse() +
+  theme_bw() +
+  theme(panel.grid = element_blank(), strip.background = element_rect(fill = 'white'))
+
+
+module.metadata <-module.metadata %>% rename(high.ox.eigen = MEblue,
+                                       low.ox.eigen = MEturquoise)
+write.csv(module.metadata, "./output/saandox.community.subnetworks.csv")
+```
+
